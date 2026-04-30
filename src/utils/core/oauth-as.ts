@@ -55,6 +55,21 @@ export interface AuthorizationCode {
   consumed: boolean;
 }
 
+export interface RefreshToken {
+  token: string;
+  clientId: string;
+  scope: string;
+  user: {
+    id: string;
+    username?: string;
+    displayName?: string;
+    email?: string;
+  };
+  createdAt: number; // epoch ms
+  expiresAt: number; // epoch ms
+  revoked: boolean;
+}
+
 // ------------------------------------------------------------------
 // TTLs
 // ------------------------------------------------------------------
@@ -62,6 +77,7 @@ export interface AuthorizationCode {
 const PENDING_AUTH_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const AUTH_CODE_TTL_MS = 60 * 1000; // 60 seconds (single-use)
 const CLIENT_TTL_MS = 24 * 60 * 60 * 1000 * 30; // 30 days (registrations)
+export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 // ------------------------------------------------------------------
 // In-memory stores
@@ -70,6 +86,7 @@ const CLIENT_TTL_MS = 24 * 60 * 60 * 1000 * 30; // 30 days (registrations)
 const clients = new Map<string, ClientRegistration>();
 const authCodes = new Map<string, AuthorizationCode>();
 const pendingAuthorizations = new Map<string, PendingAuthorization>();
+const refreshTokens = new Map<string, RefreshToken>();
 
 // ------------------------------------------------------------------
 // Pending authorization storage (server-side, keyed by transactionId)
@@ -122,7 +139,7 @@ export function registerClient(input: {
     redirectUris: input.redirectUris,
     clientName: input.clientName,
     tokenEndpointAuthMethod: 'none',
-    grantTypes: ['authorization_code'],
+    grantTypes: ['authorization_code', 'refresh_token'],
     responseTypes: ['code'],
     scope: input.scope,
   };
@@ -176,6 +193,54 @@ export function consumeAuthorizationCode(code: string): AuthorizationCode | null
 }
 
 // ------------------------------------------------------------------
+// Refresh tokens (rotating, opaque)
+// ------------------------------------------------------------------
+//
+// Rotating refresh tokens: each refresh issues a fresh access+refresh
+// pair, the old refresh token is revoked. Limits replay if a refresh
+// token leaks. Tokens are opaque random strings stored server-side.
+
+export function issueRefreshToken(input: {
+  clientId: string;
+  scope: string;
+  user: RefreshToken['user'];
+}): string {
+  const token = crypto.randomBytes(32).toString('hex');
+  const now = Date.now();
+  refreshTokens.set(token, {
+    token,
+    clientId: input.clientId,
+    scope: input.scope,
+    user: input.user,
+    createdAt: now,
+    expiresAt: now + REFRESH_TOKEN_TTL_MS,
+    revoked: false,
+  });
+  return token;
+}
+
+/**
+ * Look up and consume a refresh token. Returns the record on success
+ * (and marks it revoked so subsequent uses fail), null otherwise.
+ *
+ * Returning null covers all rejection cases — unknown token, expired,
+ * already-revoked. Caller MUST treat any null as `invalid_grant`.
+ */
+export function consumeRefreshToken(token: string): RefreshToken | null {
+  const record = refreshTokens.get(token);
+  if (!record) return null;
+  if (record.revoked) return null;
+  if (Date.now() > record.expiresAt) {
+    refreshTokens.delete(token);
+    return null;
+  }
+  record.revoked = true;
+  // Keep briefly so cleanup can collect it; do not delete immediately
+  // so detect-replay logging in the future can see the prior record.
+  return record;
+}
+
+// ------------------------------------------------------------------
 // PKCE
 // ------------------------------------------------------------------
 
@@ -220,7 +285,7 @@ export function buildAuthorizationServerMetadata(baseUrl: string, scopesSupporte
     token_endpoint: `${baseUrl}/oauth/token`,
     registration_endpoint: `${baseUrl}/oauth/register`,
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none'], // public clients w/ PKCE
     scopes_supported: scopesSupported,
@@ -232,7 +297,12 @@ export function buildAuthorizationServerMetadata(baseUrl: string, scopesSupporte
 // Periodic cleanup
 // ------------------------------------------------------------------
 
-export function cleanupExpired(): { codes: number; clients: number; pending: number } {
+export function cleanupExpired(): {
+  codes: number;
+  clients: number;
+  pending: number;
+  refresh: number;
+} {
   const now = Date.now();
   let expiredCodes = 0;
   authCodes.forEach((record, code) => {
@@ -258,16 +328,35 @@ export function cleanupExpired(): { codes: number; clients: number; pending: num
     }
   });
 
-  return { codes: expiredCodes, clients: expiredClients, pending: expiredPending };
+  // Drop refresh tokens that are either expired or revoked + older than
+  // a grace window (so we don't keep revoked rotated tokens forever).
+  let expiredRefresh = 0;
+  const REVOKED_GRACE_MS = 24 * 60 * 60 * 1000;
+  refreshTokens.forEach((record, token) => {
+    if (now > record.expiresAt) {
+      refreshTokens.delete(token);
+      expiredRefresh++;
+    } else if (record.revoked && now - record.createdAt > REVOKED_GRACE_MS) {
+      refreshTokens.delete(token);
+      expiredRefresh++;
+    }
+  });
+
+  return {
+    codes: expiredCodes,
+    clients: expiredClients,
+    pending: expiredPending,
+    refresh: expiredRefresh,
+  };
 }
 
 export function startOAuthCleanup(intervalMs: number = 5 * 60 * 1000): NodeJS.Timeout {
   return setInterval(() => {
-    const { codes, clients: removedClients, pending } = cleanupExpired();
-    if (codes > 0 || removedClients > 0 || pending > 0) {
+    const { codes, clients: removedClients, pending, refresh } = cleanupExpired();
+    if (codes > 0 || removedClients > 0 || pending > 0 || refresh > 0) {
       // Use console.error to avoid coupling to the server's log function
       console.error(
-        `[oauth-as] cleanup: removed ${codes} codes, ${removedClients} clients, ${pending} pending`,
+        `[oauth-as] cleanup: removed ${codes} codes, ${removedClients} clients, ${pending} pending, ${refresh} refresh`,
       );
     }
   }, intervalMs);
