@@ -54,6 +54,8 @@ import {
   getClient,
   issueAuthorizationCode,
   consumeAuthorizationCode,
+  issueRefreshToken,
+  consumeRefreshToken,
   verifyPkceS256,
   buildProtectedResourceMetadata,
   buildAuthorizationServerMetadata,
@@ -62,6 +64,7 @@ import {
   storePendingAuthorization,
   consumePendingAuthorization,
   PENDING_AUTH_TTL_MS,
+  REFRESH_TOKEN_TTL_MS,
   PendingAuthorization,
 } from '../utils/core/oauth-as.js';
 
@@ -1277,68 +1280,133 @@ if (TRANSPORT === 'stdio') {
       return passport.authenticate(oauthConfig!.provider, { scope: idpScope })(req, res, next);
     });
 
-    // --- Token endpoint (authorization_code grant + PKCE) ---
+    // --- Token endpoint ---
+    // Supports two grant types:
+    //   authorization_code (with PKCE): initial token exchange
+    //   refresh_token: silent renewal so the client never needs the user
+    //                  to re-auth via the IdP until the refresh token
+    //                  itself expires (REFRESH_TOKEN_TTL_MS = 30 days).
+    //
+    // Refresh tokens rotate: every successful refresh issues a new
+    // access+refresh pair and revokes the prior refresh token.
     app.post('/oauth/token', authLimiter, (req: Request, res: Response) => {
       // express-urlencoded and express.json both populate req.body, so both
       // application/x-www-form-urlencoded (per RFC 6749) and application/json
       // callers are accepted.
       const body = req.body || {};
       const grant_type = body.grant_type;
-      const code = body.code;
-      const redirect_uri = body.redirect_uri;
-      const client_id = body.client_id;
-      const code_verifier = body.code_verifier;
 
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Pragma', 'no-cache');
 
-      if (grant_type !== 'authorization_code') {
-        return res.status(400).json({ error: 'unsupported_grant_type' });
-      }
-      if (!code || !redirect_uri || !client_id || !code_verifier) {
-        return res.status(400).json({
-          error: 'invalid_request',
-          error_description: 'code, redirect_uri, client_id and code_verifier are required',
+      // Helper: build the standard token-endpoint response and mint both
+      // access_token (1 hour) and refresh_token (30 days, rotating).
+      const issueTokenPair = (
+        clientId: string,
+        scope: string,
+        user: { id: string; username?: string; displayName?: string; email?: string },
+      ) => {
+        const accessToken = jwtValidator.createToken({
+          sub: user.id,
+          scope,
+          user: {
+            id: user.id,
+            username: user.username || user.email || user.id,
+            displayName: user.displayName,
+            email: user.email,
+          },
+          client_id: clientId,
         });
+        const refreshToken = issueRefreshToken({ clientId, scope, user });
+        return {
+          access_token: accessToken,
+          token_type: 'Bearer',
+          expires_in: 3600,
+          refresh_token: refreshToken,
+          refresh_token_expires_in: Math.floor(REFRESH_TOKEN_TTL_MS / 1000),
+          scope,
+        };
+      };
+
+      // ---- authorization_code grant ----
+      if (grant_type === 'authorization_code') {
+        const code = body.code;
+        const redirect_uri = body.redirect_uri;
+        const client_id = body.client_id;
+        const code_verifier = body.code_verifier;
+
+        if (!code || !redirect_uri || !client_id || !code_verifier) {
+          return res.status(400).json({
+            error: 'invalid_request',
+            error_description: 'code, redirect_uri, client_id and code_verifier are required',
+          });
+        }
+
+        const record = consumeAuthorizationCode(code);
+        if (!record) {
+          return res.status(400).json({ error: 'invalid_grant', error_description: 'code invalid or expired' });
+        }
+        if (record.clientId !== client_id) {
+          return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
+        }
+        if (record.redirectUri !== redirect_uri) {
+          return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+        }
+        if (!verifyPkceS256(code_verifier, record.codeChallenge)) {
+          return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+        }
+
+        const tokens = issueTokenPair(record.clientId, record.scope, record.user);
+
+        log('info', 'Issued access+refresh tokens to MCP client (authorization_code)', {
+          clientId: record.clientId,
+          user: record.user.username || record.user.id,
+          scope: record.scope,
+        });
+
+        return res.json(tokens);
       }
 
-      const record = consumeAuthorizationCode(code);
-      if (!record) {
-        return res.status(400).json({ error: 'invalid_grant', error_description: 'code invalid or expired' });
-      }
-      if (record.clientId !== client_id) {
-        return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
-      }
-      if (record.redirectUri !== redirect_uri) {
-        return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
-      }
-      if (!verifyPkceS256(code_verifier, record.codeChallenge)) {
-        return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+      // ---- refresh_token grant ----
+      if (grant_type === 'refresh_token') {
+        const refresh_token = body.refresh_token;
+        const client_id = body.client_id;
+
+        if (!refresh_token) {
+          return res.status(400).json({
+            error: 'invalid_request',
+            error_description: 'refresh_token is required',
+          });
+        }
+
+        const record = consumeRefreshToken(refresh_token);
+        if (!record) {
+          return res.status(400).json({
+            error: 'invalid_grant',
+            error_description: 'refresh_token invalid, expired, or revoked',
+          });
+        }
+        if (client_id && record.clientId !== client_id) {
+          return res.status(400).json({
+            error: 'invalid_grant',
+            error_description: 'client_id mismatch',
+          });
+        }
+
+        const tokens = issueTokenPair(record.clientId, record.scope, record.user);
+
+        log('info', 'Refreshed access token for MCP client (refresh_token)', {
+          clientId: record.clientId,
+          user: record.user.username || record.user.id,
+          scope: record.scope,
+        });
+
+        return res.json(tokens);
       }
 
-      const accessToken = jwtValidator.createToken({
-        sub: record.user.id,
-        scope: record.scope,
-        user: {
-          id: record.user.id,
-          username: record.user.username || record.user.email || record.user.id,
-          displayName: record.user.displayName,
-          email: record.user.email,
-        },
-        client_id: record.clientId,
-      });
-
-      log('info', 'Issued access token to MCP client', {
-        clientId: record.clientId,
-        user: record.user.username || record.user.id,
-        scope: record.scope,
-      });
-
-      res.json({
-        access_token: accessToken,
-        token_type: 'Bearer',
-        expires_in: 3600,
-        scope: record.scope,
+      return res.status(400).json({
+        error: 'unsupported_grant_type',
+        error_description: `grant_type "${grant_type}" is not supported`,
       });
     });
   }
